@@ -3,6 +3,7 @@ import httpx
 import base64
 import re
 import os
+import time
 
 app = FastAPI()
 
@@ -35,6 +36,11 @@ HEADERS = {
 
 # 記住 SillyTavern 透過 /options 設定的值（模型、VAE），當作 override_settings 的備援
 STORED_OPTIONS = {}
+
+# 進度狀態（時間模擬用）：上游不回真實進度，這裡用「已過時間 / 預估秒數」算個會跑動的百分比
+ESTIMATED_SECONDS = 25.0  # 預估一次生圖大概多久（影響進度條速度）
+PROGRESS_STEPS = 20       # 假裝有幾個取樣步數，讓 ST 顯示 step x/20
+PROGRESS_STATE = {"active": False, "start": 0.0}
 
 
 # ==========================================
@@ -148,19 +154,30 @@ async def get_latent_upscale_modes():
 
 @app.get("/sdapi/v1/progress")
 async def get_progress():
-    # 生圖是一次性同步呼叫，沒有真實進度，回「無進行中工作」即可
+    # 上游不回真實進度，用「已過時間 / 預估秒數」模擬一個會跑動的進度條
+    if PROGRESS_STATE["active"]:
+        elapsed = time.time() - PROGRESS_STATE["start"]
+        progress = min(elapsed / ESTIMATED_SECONDS, 0.95)  # 封頂 95%，等真的生完再到 100%
+        eta_relative = max(ESTIMATED_SECONDS - elapsed, 0.0)
+        job_count, job, job_no = 1, "generating", 0
+        sampling_step = int(progress * PROGRESS_STEPS)
+    else:
+        progress, eta_relative = 0.0, 0.0
+        job_count, job, job_no = 0, "", 0
+        sampling_step = 0
+
     return {
-        "progress": 0.0,
-        "eta_relative": 0.0,
+        "progress": progress,
+        "eta_relative": eta_relative,
         "state": {
             "skipped": False,
             "interrupted": False,
-            "job": "",
-            "job_count": 0,
+            "job": job,
+            "job_count": job_count,
             "job_timestamp": "0",
-            "job_no": 0,
-            "sampling_step": 0,
-            "sampling_steps": 0,
+            "job_no": job_no,
+            "sampling_step": sampling_step,
+            "sampling_steps": PROGRESS_STEPS if PROGRESS_STATE["active"] else 0,
         },
         "current_image": None,
         "textinfo": None,
@@ -204,11 +221,18 @@ async def txt2img(request: Request):
 
         print(f"[txt2img] 模型={model} 模式={mode} 尺寸={size}")
 
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            if mode == "chat":
-                base64_image = await generate_via_chat(client, model, prompt)
-            else:
-                base64_image = await generate_via_images(client, model, prompt, size)
+        # 開始：啟動進度模擬
+        PROGRESS_STATE["active"] = True
+        PROGRESS_STATE["start"] = time.time()
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                if mode == "chat":
+                    base64_image = await generate_via_chat(client, model, prompt)
+                else:
+                    base64_image = await generate_via_images(client, model, prompt, size)
+        finally:
+            # 結束：不管成功失敗都把進度關掉
+            PROGRESS_STATE["active"] = False
 
         return {
             "images": [base64_image],
