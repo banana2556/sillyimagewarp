@@ -21,8 +21,12 @@ CHAT_ENDPOINT = f"{API_URL}/chat/completions"
 
 # 沒選 VAE 時的預設模式
 DEFAULT_MODE = "images"
-# 取不到模型 / ST 沒帶模型時的最後備援
+# ST 沒帶模型時的最後備援（正常情況不會用到）
 FALLBACK_MODEL = "gpt-4o"
+# 取不到模型清單時，顯示在 ST 下拉的提示文字（讓使用者知道設定有問題）
+NO_MODELS_LABEL = "無法取得模型，請檢查設定"
+# 取樣方法 / 排程器等假端點統一用這個，避免被誤會成真的有作用
+PLACEHOLDER = "（此設定無效，由 API 端決定）"
 
 HEADERS = {
     "Authorization": f"Bearer {API_KEY}",
@@ -85,13 +89,13 @@ async def get_models():
     except Exception as e:
         print(f"[sd-models] 取得模型列表失敗，改用備援假模型: {e}")
 
-    # 取不到就回一個假的，至少讓 ST 不會卡住
+    # 取不到就回一個提示用的項目，讓使用者在下拉直接看到設定有問題
     return [{
-        "title": FALLBACK_MODEL,
-        "model_name": FALLBACK_MODEL,
-        "hash": "123456",
+        "title": NO_MODELS_LABEL,
+        "model_name": NO_MODELS_LABEL,
+        "hash": None,
         "sha256": None,
-        "filename": FALLBACK_MODEL,
+        "filename": NO_MODELS_LABEL,
         "config": None,
     }]
 
@@ -113,14 +117,12 @@ async def get_vae():
 # ==========================================
 @app.get("/sdapi/v1/samplers")
 async def get_samplers():
-    names = ["Euler a", "Euler", "DPM++ 2M Karras", "DPM++ SDE Karras", "DDIM"]
-    return [{"name": n, "aliases": [], "options": {}} for n in names]
+    return [{"name": PLACEHOLDER, "aliases": [], "options": {}}]
 
 
 @app.get("/sdapi/v1/schedulers")
 async def get_schedulers():
-    names = ["Automatic", "Karras", "Exponential", "Normal", "Simple"]
-    return [{"name": n.lower(), "label": n} for n in names]
+    return [{"name": PLACEHOLDER, "label": PLACEHOLDER}]
 
 
 @app.get("/sdapi/v1/sd-modules")
@@ -131,7 +133,7 @@ async def get_modules():
 @app.get("/sdapi/v1/upscalers")
 async def get_upscalers():
     return [{
-        "name": "None",
+        "name": PLACEHOLDER,
         "model_name": None,
         "model_path": None,
         "model_url": None,
@@ -141,7 +143,28 @@ async def get_upscalers():
 
 @app.get("/sdapi/v1/latent-upscale-modes")
 async def get_latent_upscale_modes():
-    return [{"name": "Latent"}]
+    return [{"name": PLACEHOLDER}]
+
+
+@app.get("/sdapi/v1/progress")
+async def get_progress():
+    # 生圖是一次性同步呼叫，沒有真實進度，回「無進行中工作」即可
+    return {
+        "progress": 0.0,
+        "eta_relative": 0.0,
+        "state": {
+            "skipped": False,
+            "interrupted": False,
+            "job": "",
+            "job_count": 0,
+            "job_timestamp": "0",
+            "job_no": 0,
+            "sampling_step": 0,
+            "sampling_steps": 0,
+        },
+        "current_image": None,
+        "textinfo": None,
+    }
 
 
 # ==========================================
