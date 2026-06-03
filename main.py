@@ -1,92 +1,282 @@
 from fastapi import FastAPI, HTTPException, Request
 import httpx
 import base64
+import re
 import os
 
 app = FastAPI()
 
-# 從環境變數讀取你的 NewAPI 設定（部署到 Render 時再填入）
-NEW_API_URL = os.getenv("NEW_API_URL", "https://your-newapi-domain.com/v1/images/generations")
-NEW_API_KEY = os.getenv("NEW_API_KEY", "your_newapi_token_here")
-NEW_API_MODEL = os.getenv("NEW_API_MODEL", "gpt-4o") # 你在 NewAPI 設定的模型名稱
+# ==========================================
+# 設定：只需要兩個環境變數
+#   API_URL = 你的 API base，例如 https://your-newapi-domain.com/v1
+#   API_KEY = 你的金鑰
+# 其餘端點路徑都從 base 自動推導
+# ==========================================
+API_URL = os.getenv("API_URL", "https://your-newapi-domain.com/v1").rstrip("/")
+API_KEY = os.getenv("API_KEY", "your_newapi_token_here")
+
+MODELS_ENDPOINT = f"{API_URL}/models"
+IMAGES_ENDPOINT = f"{API_URL}/images/generations"
+CHAT_ENDPOINT = f"{API_URL}/chat/completions"
+
+# 沒選 VAE 時的預設模式
+DEFAULT_MODE = "images"
+# 取不到模型 / ST 沒帶模型時的最後備援
+FALLBACK_MODEL = "gpt-4o"
+
+HEADERS = {
+    "Authorization": f"Bearer {API_KEY}",
+    "Content-Type": "application/json",
+}
+
+# 記住 SillyTavern 透過 /options 設定的值（模型、VAE），當作 override_settings 的備援
+STORED_OPTIONS = {}
+
 
 # ==========================================
-# 1. 處理 SillyTavern 的設定讀取 (打招呼，解決 404 錯誤)
+# 1. SillyTavern 設定讀取 / 寫入
 # ==========================================
 @app.get("/sdapi/v1/options")
 async def get_options():
-    # 回傳一個空的 JSON，讓 SillyTavern 收到 HTTP 200 OK 即可
+    # 回傳記住的設定，沒有就空的
+    return STORED_OPTIONS
+
+
+@app.post("/sdapi/v1/options")
+async def set_options(request: Request):
+    # SillyTavern 選模型 / VAE 時會打這裡，把它記下來
+    try:
+        payload = await request.json()
+        if isinstance(payload, dict):
+            STORED_OPTIONS.update(payload)
+    except Exception:
+        pass
     return {}
 
+
 # ==========================================
-# 2. 處理 SillyTavern 獲取模型列表 (偽裝一個假模型給它選)
+# 2. 模型列表：直接去打你 API 的 /models，回真實清單給 ST
 # ==========================================
 @app.get("/sdapi/v1/sd-models")
 async def get_models():
-    return [
-        {
-            "title": "NewAPI_Proxy_Model",
-            "model_name": "NewAPI_Proxy_Model",
-            "hash": "123456",
-            "filename": "newapi.safetensors"
-        }
-    ]
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(MODELS_ENDPOINT, headers=HEADERS)
+            resp.raise_for_status()
+            data = resp.json()
+
+        # OpenAI 格式是 {"data": [{"id": "..."}]}，也相容直接給 list 的情況
+        raw = data.get("data", data) if isinstance(data, dict) else data
+        result = []
+        for m in raw:
+            mid = m.get("id") if isinstance(m, dict) else str(m)
+            if not mid:
+                continue
+            result.append({
+                "title": mid,
+                "model_name": mid,
+                "hash": None,
+                "sha256": None,
+                "filename": mid,
+                "config": None,
+            })
+        if result:
+            return result
+    except Exception as e:
+        print(f"[sd-models] 取得模型列表失敗，改用備援假模型: {e}")
+
+    # 取不到就回一個假的，至少讓 ST 不會卡住
+    return [{
+        "title": FALLBACK_MODEL,
+        "model_name": FALLBACK_MODEL,
+        "hash": "123456",
+        "sha256": None,
+        "filename": FALLBACK_MODEL,
+        "config": None,
+    }]
+
 
 # ==========================================
-# 3. 核心生圖邏輯 (將 A1111 格式轉換為 OpenAI 格式)
+# 3. VAE 端點：拿來當「模式開關」（VAE 本來就是假資料）
+#    在 ST 的 VAE 下拉選 mode-chat 就走 chat，否則走 images
+# ==========================================
+@app.get("/sdapi/v1/sd-vae")
+async def get_vae():
+    return [
+        {"model_name": "mode-images", "filename": "mode-images"},
+        {"model_name": "mode-chat", "filename": "mode-chat"},
+    ]
+
+
+# ==========================================
+# 4. 其他假資料端點（消掉 ST 啟動時的一堆 404）
+# ==========================================
+@app.get("/sdapi/v1/samplers")
+async def get_samplers():
+    names = ["Euler a", "Euler", "DPM++ 2M Karras", "DPM++ SDE Karras", "DDIM"]
+    return [{"name": n, "aliases": [], "options": {}} for n in names]
+
+
+@app.get("/sdapi/v1/schedulers")
+async def get_schedulers():
+    names = ["Automatic", "Karras", "Exponential", "Normal", "Simple"]
+    return [{"name": n.lower(), "label": n} for n in names]
+
+
+@app.get("/sdapi/v1/sd-modules")
+async def get_modules():
+    return []
+
+
+@app.get("/sdapi/v1/upscalers")
+async def get_upscalers():
+    return [{
+        "name": "None",
+        "model_name": None,
+        "model_path": None,
+        "model_url": None,
+        "scale": 4,
+    }]
+
+
+@app.get("/sdapi/v1/latent-upscale-modes")
+async def get_latent_upscale_modes():
+    return [{"name": "Latent"}]
+
+
+# ==========================================
+# 5. 核心生圖
 # ==========================================
 @app.post("/sdapi/v1/txt2img")
 async def txt2img(request: Request):
     try:
-        # 接收 SillyTavern (A1111 格式) 的請求
         payload = await request.json()
         prompt = payload.get("prompt", "")
-        
-        # 處理負面提示詞 (將其拼接到正面提示詞後方，因為 OpenAI 不支援負面參數)
+
+        # 把收到的 prompt 印進 log
+        print(f"[txt2img] 收到 Prompt: {prompt}")
+
+        # 負面提示詞：OpenAI 不支援，拼到後面
         negative_prompt = payload.get("negative_prompt", "")
         if negative_prompt:
             prompt += f" \n(Please DO NOT include: {negative_prompt})"
 
-        # 轉換為 OpenAI / DALL-E 的請求格式
-        openai_payload = {
-            "model": NEW_API_MODEL,
-            "prompt": prompt,
-            "n": 1,
-            "size": "1024x1024"
-        }
-        headers = {
-            "Authorization": f"Bearer {NEW_API_KEY}",
-            "Content-Type": "application/json"
-        }
+        override = payload.get("override_settings") or {}
 
-        # 發送請求給 NewAPI (使用 httpx 處理非同步請求)
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(NEW_API_URL, json=openai_payload, headers=headers)
-            response.raise_for_status() # 如果發生錯誤(如 401 授權失敗)，這裡會拋出異常
-            data = response.json()
+        # 決定模型：override > 記住的 > 備援
+        model = (
+            override.get("sd_model_checkpoint")
+            or STORED_OPTIONS.get("sd_model_checkpoint")
+            or FALLBACK_MODEL
+        )
 
-            # 取得圖片結果
-            # OpenAI 格式通常預設回傳圖片 URL，但 A1111 需要的是 Base64 字串
-            # 所以我們要把圖片下載下來轉成 Base64
-            image_url = data["data"][0]["url"]
-            img_response = await client.get(image_url)
-            img_response.raise_for_status()
-            
-            base64_image = base64.b64encode(img_response.content).decode('utf-8')
+        # 決定模式：看選的 VAE
+        vae = override.get("sd_vae") or STORED_OPTIONS.get("sd_vae") or ""
+        mode = "chat" if "chat" in str(vae).lower() else DEFAULT_MODE
 
-        # 包裝成 A1111 格式回傳給 SillyTavern
+        # 尺寸：讀 ST 傳的 width/height，不再寫死
+        width = payload.get("width", 1024)
+        height = payload.get("height", 1024)
+        size = f"{width}x{height}"
+
+        print(f"[txt2img] 模型={model} 模式={mode} 尺寸={size}")
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            if mode == "chat":
+                base64_image = await generate_via_chat(client, model, prompt)
+            else:
+                base64_image = await generate_via_images(client, model, prompt, size)
+
         return {
             "images": [base64_image],
             "parameters": payload,
-            "info": "{}"
+            "info": "{}",
         }
 
     except Exception as e:
-        print(f"Error occurred: {str(e)}")
+        print(f"[txt2img] 發生錯誤: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ---- images 端點：OpenAI /images/generations ----
+async def generate_via_images(client, model, prompt, size):
+    openai_payload = {
+        "model": model,
+        "prompt": prompt,
+        "n": 1,
+        "size": size,
+    }
+    resp = await client.post(IMAGES_ENDPOINT, json=openai_payload, headers=HEADERS)
+    resp.raise_for_status()
+    item = resp.json()["data"][0]
+
+    if item.get("b64_json"):
+        return item["b64_json"]
+    if item.get("url"):
+        return await download_as_base64(client, item["url"])
+    raise ValueError("images 回應裡找不到 b64_json 或 url")
+
+
+# ---- chat 端點：/chat/completions，從文字回應抽圖 ----
+async def generate_via_chat(client, model, prompt):
+    chat_payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    resp = await client.post(CHAT_ENDPOINT, json=chat_payload, headers=HEADERS)
+    resp.raise_for_status()
+    content = resp.json()["choices"][0]["message"]["content"]
+
+    # content 可能是字串，也可能是 OpenAI 多模態的 list
+    if isinstance(content, list):
+        content = " ".join(
+            part.get("text", "") if isinstance(part, dict) else str(part)
+            for part in content
+        )
+
+    return await extract_image_base64(client, content)
+
+
+# ---- 從一段文字裡抽出圖片，回傳 base64 ----
+async def extract_image_base64(client, text):
+    text = text or ""
+
+    # 1) base64 data URI：data:image/png;base64,xxxx
+    m = re.search(r"data:image/\w+;base64,([A-Za-z0-9+/=]+)", text)
+    if m:
+        return m.group(1)
+
+    # 2) Markdown 圖片連結：![alt](https://...)
+    m = re.search(r"!\[[^\]]*\]\((https?://[^\s)]+)\)", text)
+    if m:
+        return await download_as_base64(client, m.group(1))
+
+    # 3) 純網址
+    m = re.search(r"https?://[^\s)\"']+", text)
+    if m:
+        return await download_as_base64(client, m.group(0))
+
+    # 4) 整段就是 base64（去掉空白後嘗試解碼）
+    stripped = re.sub(r"\s+", "", text)
+    if len(stripped) > 100:
+        try:
+            base64.b64decode(stripped, validate=True)
+            return stripped
+        except Exception:
+            pass
+
+    raise ValueError(f"chat 回應裡抽不到圖片，原始內容: {text[:200]}")
+
+
+# ---- 下載圖片 URL 並轉 base64 ----
+async def download_as_base64(client, url):
+    img_resp = await client.get(url)
+    img_resp.raise_for_status()
+    return base64.b64encode(img_resp.content).decode("utf-8")
+
+
 # ==========================================
-# 4. Render 健康檢查用的端點
+# 6. 健康檢查
 # ==========================================
 @app.get("/")
 def read_root():
