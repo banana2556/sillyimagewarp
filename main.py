@@ -59,8 +59,9 @@ async def set_options(request: Request):
         payload = await request.json()
         if isinstance(payload, dict):
             STORED_OPTIONS.update(payload)
-    except Exception:
-        pass
+        print(f"[options] 收到設定: {payload}")  # 除錯：ST 設定模型/VAE 時的內容
+    except Exception as e:
+        print(f"[options] 解析失敗: {e}")
     return {}
 
 
@@ -202,6 +203,11 @@ async def txt2img(request: Request):
             prompt += f" \n(Please DO NOT include: {negative_prompt})"
 
         override = payload.get("override_settings") or {}
+
+        # --- 除錯：印出 ST 實際送來的內容，定位模型為何沒帶進來 ---
+        print(f"[debug] payload keys = {list(payload.keys())}")
+        print(f"[debug] override_settings = {override}")
+        print(f"[debug] STORED_OPTIONS = {STORED_OPTIONS}")
 
         # 決定模型：override > 記住的 > 備援
         model = (
